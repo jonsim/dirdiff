@@ -1,0 +1,402 @@
+#!/usr/bin/env python
+# (c) Copyright 2017-2018 Jonathan Simmonds
+# Calculate the difference between two directory structures.
+from __future__ import print_function
+import argparse
+from collections import deque
+import hashlib
+import os
+import pyutils.ansi as ansi
+import pyutils.console as console
+
+def rpad(string, width):
+    """Inserts padding to the left of a string to be at least 'width' wide.
+
+    Args:
+        string: String to pad.
+        width:  Width to make the string at least. May be 0 to not pad.
+
+    Returns:
+        Padded string.
+    """
+    if width > 0 and ansi.length(string) < width:
+        return string + ' ' * (width - ansi.length(string))
+    return string
+
+class SideBySidePrinter(object):
+    def __init__(self):
+        self.separator = u' \u2502 '
+        self.full_width, _ = console.size()
+        self.side_width = (self.full_width - len(self.separator)) / 2
+        self.cache_l = deque()
+        self.cache_r = deque()
+
+    def _pump_caches(self):
+        while self.cache_l and self.cache_r:
+            print(rpad(self.cache_l.popleft(), self.side_width) + \
+                  self.separator + \
+                  rpad(self.cache_r.popleft(), self.side_width))
+
+    def purge(self):
+        while self.cache_l or self.cache_r:
+            l = self.cache_l.popleft() if self.cache_l else ''
+            r = self.cache_r.popleft() if self.cache_r else ''
+            print(rpad(l, self.side_width) + \
+                  self.separator + \
+                  rpad(r, self.side_width))
+
+    def add_left(self, string):
+        self.cache_l.extend(ansi.wrap(string, self.side_width))
+        self._pump_caches()
+
+    def add_right(self, string):
+        self.cache_r.extend(ansi.wrap(string, self.side_width))
+        self._pump_caches()
+
+def hash_file(path):
+    builder = hashlib.md5()
+    with open(path, 'rb') as f:
+        while True:
+            data = f.read(0x10000)  # 64k at a time
+            if not data:
+                break
+            builder.update(data)
+    # TODO: why the fuck am I returning a string here? hello it's a fucking number
+    return builder.hexdigest()
+
+def hash_dir(child_hashes):
+    builder = hashlib.md5()
+    for child_hash in child_hashes:
+        builder.update(child_hash)
+    return builder.hexdigest()
+
+def decorate_path(path, name=None):
+    if not name:
+        name = os.path.basename(path)
+    if os.path.islink(path):
+        formatting = [ansi.BOLD, ansi.FG_CYAN]
+    elif os.path.isdir(path):
+        formatting = [ansi.BOLD, ansi.FG_BLUE]
+    elif os.access(path, os.X_OK):
+        formatting = [ansi.BOLD, ansi.FG_GREEN]
+    else:
+        return name
+    return ansi.decorate(name, *formatting)
+
+def decorate_hash(hash_str):
+    return '(%s)' % (ansi.decorate(hash_str[:7], ansi.ITALIC))
+
+
+class INode(object):
+    def __init__(self, path):
+        self.path = path
+        self.name = os.path.basename(path) if path is not None else None
+
+    def _get_padding(self, level, level_last):
+        padding = ''
+        if level > 0:
+            for last in level_last[:-1]:
+                padding += u'\u2502   ' if not last else '    '
+            if level_last[-1]:
+                padding += u'\u2514\u2500\u2500 '
+            else:
+                padding += u'\u251C\u2500\u2500 '
+        return padding
+
+    def output(self, print_func=print, level=0, level_last=[]):
+        raise NotImplementedError
+
+    def __lt__(self, other):
+        return self.path < other.path
+
+    def __le__(self, other):
+        return self.path <= other.path
+
+    def __gt__(self, other):
+        return self.path > other.path
+
+    def __ge__(self, other):
+        return self.path >= other.path
+
+    def __eq__(self, other):
+        return isinstance(self, other.__class__) and self.path == other.path
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __str__(self):
+        return '%s(%s)' % (self.__class__.__name__, self.path)
+
+class FileNode(INode):
+    def __init__(self, path):
+        super(FileNode, self).__init__(path)
+        self.hash = hash_file(path)
+
+    def output(self, print_func=print, level=0, level_last=[]):
+        name_padding = self._get_padding(level, level_last)
+        decorated_name = decorate_path(self.path, self.name)
+        decorated_hash = decorate_hash(self.hash)
+        name_width = len(name_padding) + len(self.name)
+        hash_padding = ' ' * (48 - name_width) if name_width < 48 else ''
+        print_func(name_padding + decorated_name + hash_padding + decorated_hash)
+
+class DirNode(INode):
+    def __init__(self, path, include_hidden=False):
+        super(DirNode, self).__init__(path)
+        contents = os.listdir(path)
+        self.subdirs, self.files = [], []
+        for content in contents:
+            if not include_hidden and content[0] == '.':
+                continue
+            content_path = os.path.join(path, content)
+            if os.path.isdir(content_path):
+                self.subdirs.append(DirNode(content_path, include_hidden))
+            else:
+                self.files.append(FileNode(content_path))
+        self.subdirs.sort()
+        self.files.sort()
+        self.hash = hash_dir([c.hash for c in self.subdirs + self.files])
+
+    def output(self, print_func=print, level=0, level_last=[]):
+        name_padding = self._get_padding(level, level_last)
+        decorated_name = decorate_path(self.path, self.name)
+        decorated_hash = decorate_hash(self.hash)
+        name_width = len(name_padding) + len(self.name)
+        hash_padding = ' ' * (48 - name_width) if name_width < 48 else ''
+        print_func(name_padding + decorated_name + hash_padding + decorated_hash)
+        for idx, subdir in enumerate(self.subdirs):
+            is_last = not self.files and (idx == len(self.subdirs) - 1)
+            subdir.output(print_func, level + 1, level_last + [is_last])
+        for idx, subfile in enumerate(self.files):
+            is_last = idx == len(self.files) - 1
+            subfile.output(print_func, level + 1, level_last + [is_last])
+
+class NullNode(INode):
+    def __init__(self, child):
+        super(NullNode, self).__init__(None)
+        self.hash = None
+        self.child = child
+
+    def output(self, print_func=print, level=0, level_last=[]):
+        print_func(self._get_padding(level, level_last))
+        if child:
+            child.output(print_func, level + 1, level_last + [True])
+
+
+def find_subtrees(left, right):
+    # TODO: This fella definitely wants unit tests.
+    if left.hash == right.hash:
+        return [(left, right)]
+
+    subtrees = []
+    right_hashes = {}
+    to_search_left = deque([left])
+    to_search_right = deque([right])
+    while not subtrees and (to_search_left or to_search_right):
+        this_right = to_search_right.popleft()
+        if this_right:
+            for subdir in right.subdirs:
+                if subdir.hash not in right_hashes:
+                    right_hashes[subdir.hash] = subdir
+        this_left = to_search_left.popleft()
+        if this_left:
+            for subdir in left.subdirs:
+                if subdir.hash in right_hashes:
+                    subtrees.append((subdir, right_hashes[subdir.hash]))
+
+        to_search_left.extend(left.subdirs)
+        to_search_right.extend(right.subdirs)
+
+    return subtrees
+
+def stable_match(men, women, preferences):
+    def woman_prefers_m1_to_m2(woman_preferences, man1, man2):
+        for man, score in woman_preferences:
+            if man == man1:
+                return True
+            elif man == man2:
+                return False
+        assert(False) # Unreachable unless fucked.
+
+    print('Stable matching between men: %s, women: %s...' % ([str(m) for m in men], [str(w) for w in women]))
+    # Build men preferences ordered lists (sorted so most preferred at end).
+    men_preferences = {}
+    for man in men:
+        men_preferences[man] = []
+        for woman in women:
+            same, diff = preferences[man][woman]
+            if same == 0 and diff == 0:
+                score = 0.0
+            else:
+                score = float(same) / (same + diff)
+            print('mpreferences[%s][%s] = %.1f' % (str(man), str(woman), score))
+            men_preferences[man].append((woman, score))
+        men_preferences[man].sort(key=lambda k: k[1])
+    # Build women preferences ordered lists (sorted so most preferred at end).
+    women_preferences = {}
+    for woman in women:
+        women_preferences[woman] = []
+        for man in men:
+            same, diff = preferences[man][woman]
+            if same == 0 and diff == 0:
+                score = 0.0
+            else:
+                score = float(same) / (same + diff)
+            print('wpreferences[%s][%s] = %.1f' % (str(man), str(woman), score))
+            women_preferences[woman].append((man, score))
+        women_preferences[woman].sort(key=lambda k: k[1])
+
+    unengaged_men = deque(men)
+    matchings = {}
+    while unengaged_men:
+        man = unengaged_men[0]
+        print('  matching ' + str(man))
+        woman = men_preferences[man].pop()[0]
+        print('    potentially to ' + str(woman))
+        if woman not in matchings:
+            #Bliss
+            unengaged_men.popleft()
+            matchings[woman] = man
+            print('    matched')
+        else:
+            existing_man = matchings[woman]
+            print('    providing preferred to ' + str(existing_man))
+            if woman_prefers_m1_to_m2(women_preferences[woman], man, existing_man):
+                #DumpTheChump
+                unengaged_men.popleft()
+                unengaged_men.append(existing_man)
+                matchings[woman] = man
+                print('    matched')
+    print('  matched: %s' % (str(list(matchings.items()))))
+    return list(matchings.items())
+
+def associate_dirs(ldirs, rdirs, calc_similarity, threshold=0.66):
+    # We could apply stable matching here too, however the similarities /
+    # preferences in this case are symmetrical (i.e. if A prefers B the most,
+    # B also prefers A the most) - so we don't need full-blown stable matching.
+
+    # Build global list of matches and sort ascending (best matches last).
+    matches = []
+    for ld in ldirs:
+        for rd in rdirs:
+            matches.append((ld, rd, calc_similarity(ld, rd)))
+    matches.sort(key=lambda k: k[2], reverse=True)
+
+    # Extract the best matches possible until none remain.
+    unique_matches = []
+    # Ensure we only look at the side with the fewest directories.
+    side_index = 0 if len(ldirs) <= len(rdirs) else 1
+    for match in matches:
+        if match[2] < threshold:
+            break
+        if match[side_index] not in [m[side_index] for m in unique_matches]:
+            unique_matches.append((match[0], match[1]))
+
+    # Add the missing unmatched subdirs.
+    for ld in ldirs:
+        if ld not in [m[0] for m in unique_matches]:
+            unique_matches.append((ld, None))
+    for rd in rdirs:
+        if rd not in [m[1] for m in unique_matches]:
+            unique_matches.append((None, rd))
+
+    print('  associate_dirs = ' + str(['(%s, %s)' % (str(m[0]), str(m[1])) for m in unique_matches]))
+    return unique_matches
+
+def calculate_file_counts(lfiles, rfiles):
+    lfile_hashes = [f.hash for f in lfiles]
+    rfile_hashes = [f.hash for f in rfiles]
+    combined_file_hashes = lfile_hashes + rfile_hashes
+    unique_file_hashes = set(combined_file_hashes)
+    files_same = min(len(combined_file_hashes) - len(unique_file_hashes),
+                        len(lfile_hashes), len(rfile_hashes))
+    files_different = max(len(unique_file_hashes) - files_same,
+                            abs(len(lfile_hashes) - len(rfile_hashes)))
+    return files_same, files_different
+
+def calculate_recursive_file_counts(d1, d2):
+    dirs = deque()
+    dirs.append((d1, d2))
+    total_same, total_diff = 0, 0
+
+    while dirs:
+        ld, rd = dirs.popleft()
+        ld_files, ld_subdirs = (ld.files, ld.subdirs) if ld else ([], [])
+        rd_files, rd_subdirs = (rd.files, rd.subdirs) if rd else ([], [])
+
+        # TODO: this is redoing calculations from previous calls of associate_dirs.
+        files_same, files_diff = calculate_file_counts(ld_files, rd_files)
+        total_same += files_same
+        total_diff += files_diff
+
+        subdir_pairings = associate_dirs(ld_subdirs, rd_subdirs,
+                                            calculate_recursive_dir_similarity)
+        dirs.extend(subdir_pairings)
+
+    print('calculate_recursive_file_counts(%s, %s) = %d, %d' % (str(d1), str(d2), total_same, total_diff))
+    return total_same, total_diff
+
+def calculate_dir_similarity(d1, d2):
+    if not d1 or not d2:
+        return 0.0
+    files_same, files_different = calculate_file_counts(d1, d2)
+    if files_same == 0 and files_different == 0:
+        similarity = 1.0
+    else:
+        similarity = float(files_same) / (files_same + files_different)
+    #print('calculate_dir_similarity(%s,%s) = %.2f (%d, %d)' % \
+    #      (str(d1), str(d2), similarity, files_same, files_different))
+    return similarity
+
+def calculate_recursive_dir_similarity(d1, d2):
+    if not d1 or not d2:
+        return 0.0
+    files_same, files_different = calculate_recursive_file_counts(d1, d2)
+    if files_same == 0 and files_different == 0:
+        similarity = 1.0
+    else:
+        similarity = float(files_same) / (files_same + files_different)
+    #print('calculate_recursive_dir_similarity(%s,%s) = %.2f (%d, %d)' % \
+    #      (str(d1), str(d2), similarity, files_same, files_different))
+    return similarity
+
+def calculate_dir_pairings(dir1, dir2, threshold=0.66):
+    return associate_dirs([dir1], [dir2], calculate_recursive_dir_similarity)
+
+def main():
+    """Main method."""
+    # Handle command line
+    parser = argparse.ArgumentParser(description='Calculate the difference '
+                                     'between two directory structures.')
+    parser.add_argument('dir1', type=str,
+                        help='Directory to compute the differences from.')
+    parser.add_argument('dir2', type=str,
+                        help='Directory to compute the differences to.')
+    args = parser.parse_args()
+
+    # Strip trailing path-separators
+    if len(args.dir1) > 1 and args.dir1.endswith(os.sep):
+        args.dir1 = args.dir1[:-len(os.sep)]
+    if len(args.dir2) > 1 and args.dir2.endswith(os.sep):
+        args.dir2 = args.dir2[:-len(os.sep)]
+
+    printer = SideBySidePrinter()
+
+    dir1 = DirNode(args.dir1)
+    dir2 = DirNode(args.dir2)
+
+    dir1.output(print_func=printer.add_left)
+    dir2.output(print_func=printer.add_right)
+    printer.purge()
+
+    #print('Subtrees:')
+    #print('\n'.join(['  %s, %s' % (l, r) for l, r in find_subtrees(dir1, dir2)]))
+
+    sim = calculate_recursive_dir_similarity(dir1, dir2)
+    print('Similarity = %.2f' % (sim))
+    #pairings = calculate_dir_pairings(dir1, dir2)
+    #print('Pairings:')
+    #print('\n'.join(['  (%s, %s)' % (str(m[0]), str(m[1])) for m in pairings]))
+
+if __name__ == '__main__':
+    main()
