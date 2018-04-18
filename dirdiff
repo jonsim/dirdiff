@@ -303,6 +303,52 @@ def associate_dirs(ldirs, rdirs, calc_similarity, threshold=0.66):
     print('  associate_dirs = ' + str(['(%s, %s)' % (str(m[0]), str(m[1])) for m in unique_matches]))
     return unique_matches
 
+
+def calculate_dir_pairings(ldir, rdir, calc_similarity, threshold=0.66):
+    ldirs, rdirs = [], []
+
+    ldirs.append(ldir)
+    extend_index = 0
+    while extend_index < len(ldirs):
+        ldirs.extend(ldirs[extend_index].subdirs)
+        extend_index += 1
+
+    rdirs.append(rdir)
+    extend_index = 0
+    while extend_index < len(rdirs):
+        rdirs.extend(rdirs[extend_index].subdirs)
+        extend_index += 1
+
+    pairings = []
+    for ld in ldirs:
+        for rd in rdirs:
+            pairings.append((ld, rd, calc_similarity(ld, rd)))
+    pairings.sort(key=lambda k: k[2], reverse=True)
+
+    print('possible pairings:' + '\n'.join(['  (%-27s, %-22s) = %.2f' % (str(l), str(r), s) for l, r, s in pairings]))
+
+    # Extract the best pairings possible until none remain.
+    unique_pairings = []
+    # Ensure we only look at the side with the fewest directories.
+    side_index = 0 if len(ldirs) <= len(rdirs) else 1
+    for pair in pairings:
+        if pair[2] < threshold:
+            break
+        if pair[side_index] not in [m[side_index] for m in unique_pairings]:
+            unique_pairings.append((pair[0], pair[1]))
+
+    # Add the missing unpaired subdirs.
+    for ld in ldirs:
+        if ld not in [m[0] for m in unique_pairings]:
+            unique_pairings.append((ld, None))
+    for rd in rdirs:
+        if rd not in [m[1] for m in unique_pairings]:
+            unique_pairings.append((None, rd))
+
+    print('  calculate_dir_pairings = ' + str(['(%s, %s)' % (str(m[0]), str(m[1])) for m in unique_pairings]))
+    return unique_pairings
+
+
 def calculate_file_counts(lfiles, rfiles):
     lfile_hashes = [f.hash for f in lfiles]
     rfile_hashes = [f.hash for f in rfiles]
@@ -360,9 +406,6 @@ def calculate_recursive_dir_similarity(d1, d2):
     #      (str(d1), str(d2), similarity, files_same, files_different))
     return similarity
 
-def calculate_dir_pairings(dir1, dir2, threshold=0.66):
-    return associate_dirs([dir1], [dir2], calculate_recursive_dir_similarity)
-
 def main():
     """Main method."""
     # Handle command line
@@ -394,9 +437,10 @@ def main():
 
     sim = calculate_recursive_dir_similarity(dir1, dir2)
     print('Similarity = %.2f' % (sim))
-    #pairings = calculate_dir_pairings(dir1, dir2)
-    #print('Pairings:')
-    #print('\n'.join(['  (%s, %s)' % (str(m[0]), str(m[1])) for m in pairings]))
+
+    pairings = calculate_dir_pairings(dir1, dir2, calculate_recursive_dir_similarity)
+    print('Pairings:')
+    print('\n'.join(['  (%s, %s)' % (str(m[0]), str(m[1])) for m in pairings]))
 
 if __name__ == '__main__':
     main()
