@@ -141,16 +141,17 @@ class FileNode(INode):
         print_func(name_padding + decorated_name + hash_padding + decorated_hash)
 
 class DirNode(INode):
-    def __init__(self, path, include_hidden=False):
+    def __init__(self, path, parent=None, include_hidden=False):
         super(DirNode, self).__init__(path)
         contents = os.listdir(path)
+        self.parent = parent
         self.subdirs, self.files = [], []
         for content in contents:
             if not include_hidden and content[0] == '.':
                 continue
             content_path = os.path.join(path, content)
             if os.path.isdir(content_path):
-                self.subdirs.append(DirNode(content_path, include_hidden))
+                self.subdirs.append(DirNode(content_path, self, include_hidden))
             else:
                 self.files.append(FileNode(content_path))
         self.subdirs.sort()
@@ -300,38 +301,114 @@ def associate_dirs(ldirs, rdirs, calc_similarity, threshold=0.66):
         if rd not in [m[1] for m in unique_matches]:
             unique_matches.append((None, rd))
 
-    print('  associate_dirs = ' + str(['(%s, %s)' % (str(m[0]), str(m[1])) for m in unique_matches]))
+    #print('  associate_dirs = ' + str(['(%s, %s)' % (str(m[0]), str(m[1])) for m in unique_matches]))
     return unique_matches
 
 
-def calculate_dir_pairings(ldir, rdir, calc_similarity, threshold=0.66):
-    ldirs, rdirs = [], []
+def calculate_dir_pairings(ldir, rdir, threshold=0.66):
+    ldirs, rdirs = [ldir], [rdir]
 
-    ldirs.append(ldir)
     extend_index = 0
     while extend_index < len(ldirs):
         ldirs.extend(ldirs[extend_index].subdirs)
         extend_index += 1
 
-    rdirs.append(rdir)
     extend_index = 0
     while extend_index < len(rdirs):
         rdirs.extend(rdirs[extend_index].subdirs)
         extend_index += 1
 
-    pairings = []
+    possible_pairings = []
     for ld in ldirs:
         for rd in rdirs:
-            pairings.append((ld, rd, calc_similarity(ld, rd)))
-    pairings.sort(key=lambda k: k[2], reverse=True)
+            same, diff = calculate_recursive_file_counts(ld, rd)
+            similarity = float(same) / (same + diff)
+            possible_pairings.append((ld, rd, same, diff, similarity))
+    possible_pairings.sort(key=lambda k: k[4], reverse=True)
 
-    print('possible pairings:' + '\n'.join(['  (%-27s, %-22s) = %.2f' % (str(l), str(r), s) for l, r, s in pairings]))
+    print('possible_pairings:\n' + '\n'.join(['  (%-27s, %-22s) = %d, %d, %.2f' % (str(l), str(r), s, d, v) for l, r, s, d, v in possible_pairings]))
+
+    # Find all structures which would permit at least one pairing.
+    possible_structures = []
+    # for initial_pairing in possible_pairings:
+    #     if initial_pairing[4] < 0.01:
+    #         break
+    #     structure = [initial_pairing]
+    #     for pairing in possible_pairings:
+    #         # Can we fit this pairing in?
+    for ld in ldirs:
+        # Find this dir's best pairing.
+        best_pair = None
+        for pair in possible_pairings:
+            if pair[0] is ld:
+                best_pair = pair
+                break
+        # Find all pairings which are possible given we must have best_pair.
+        structure = [best_pair]
+        for pair in possible_pairings:
+            # Check neither L or R are already paired.
+            if pair[0] in [p[0] for p in structure] or \
+               pair[1] in [p[1] for p in structure]:
+               continue
+
+            # Build left and right parent hierarchies.
+            l_parent_hierarchy = [pair[0]]
+            while l_parent_hierarchy[-1].parent:
+                l_parent_hierarchy.append(l_parent_hierarchy[-1].parent)
+            r_parent_hierarchy = [pair[1]]
+            while r_parent_hierarchy[-1].parent:
+                r_parent_hierarchy.append(r_parent_hierarchy[-1].parent)
+
+            # Find closest aligned left parent.
+            l_closest_aligned_parent = None
+            for parent in l_parent_hierarchy:
+                for struct in structure:
+                    if struct[0] == parent:
+                        l_closest_aligned_parent = struct
+                        break
+            # If L has a closest aligned parent, check R is in the aligned-tree.
+            if l_closest_aligned_parent:
+                if not struct[1] in r_parent_hierarchy:
+                    continue
+
+            # Find closest aligned right parent.
+            r_closest_aligned_parent = None
+            for parent in r_parent_hierarchy:
+                for struct in structure:
+                    if struct[1] == parent:
+                        r_closest_aligned_parent = struct
+                        break
+            # If R has a closest aligned parent, check L is in the aligned-tree.
+            if r_closest_aligned_parent:
+                if not struct[0] in l_parent_hierarchy:
+                    continue
+
+            # If the pair has passed all these rules it's legal commit to its
+            # alignment.
+            structure.append(pair)
+
+        # Calculate the score of the structure.
+        structure_same = sum([p[2] for p in structure])
+        structure_diff = sum([p[3] for p in structure])
+        structure_ratio = float(structure_same) / (structure_same + structure_diff)
+
+        # Add the structure to all structures.
+        possible_structures.append((structure, structure_ratio))
+
+
+    print('possible_structures:\n' + '\n\n'.join(
+        ['\n'.join(
+            ['  (%s, %s)' % (str(l), str(r)) for l, r, s, d, v in struct[0]]
+        ) + '\n= %.2f' % (struct[1]) for struct in possible_structures]
+        ))
+    if not possible_structures:
+        raise Exception('I have failed you')
 
     # Extract the best pairings possible until none remain.
     unique_pairings = []
     # Ensure we only look at the side with the fewest directories.
     side_index = 0 if len(ldirs) <= len(rdirs) else 1
-    for pair in pairings:
+    for pair in possible_pairings:
         if pair[2] < threshold:
             break
         if pair[side_index] not in [m[side_index] for m in unique_pairings]:
@@ -379,7 +456,7 @@ def calculate_recursive_file_counts(d1, d2):
                                             calculate_recursive_dir_similarity)
         dirs.extend(subdir_pairings)
 
-    print('calculate_recursive_file_counts(%s, %s) = %d, %d' % (str(d1), str(d2), total_same, total_diff))
+    #print('calculate_recursive_file_counts(%s, %s) = %d, %d' % (str(d1), str(d2), total_same, total_diff))
     return total_same, total_diff
 
 def calculate_dir_similarity(d1, d2):
@@ -435,10 +512,7 @@ def main():
     #print('Subtrees:')
     #print('\n'.join(['  %s, %s' % (l, r) for l, r in find_subtrees(dir1, dir2)]))
 
-    sim = calculate_recursive_dir_similarity(dir1, dir2)
-    print('Similarity = %.2f' % (sim))
-
-    pairings = calculate_dir_pairings(dir1, dir2, calculate_recursive_dir_similarity)
+    pairings = calculate_dir_pairings(dir1, dir2)
     print('Pairings:')
     print('\n'.join(['  (%s, %s)' % (str(m[0]), str(m[1])) for m in pairings]))
 
