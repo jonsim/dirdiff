@@ -6,6 +6,7 @@ import argparse
 from collections import deque
 import hashlib
 import os
+import math
 import pyutils.ansi as ansi
 import pyutils.console as console
 
@@ -141,9 +142,10 @@ class FileNode(INode):
         print_func(name_padding + decorated_name + hash_padding + decorated_hash)
 
 class DirNode(INode):
-    def __init__(self, path, parent=None, include_hidden=False):
+    def __init__(self, path, level=0, parent=None, include_hidden=False):
         super(DirNode, self).__init__(path)
         contents = os.listdir(path)
+        self.level = level
         self.parent = parent
         self.subdirs, self.files = [], []
         for content in contents:
@@ -151,7 +153,7 @@ class DirNode(INode):
                 continue
             content_path = os.path.join(path, content)
             if os.path.isdir(content_path):
-                self.subdirs.append(DirNode(content_path, self, include_hidden))
+                self.subdirs.append(DirNode(content_path, level + 1, self, include_hidden))
             else:
                 self.files.append(FileNode(content_path))
         self.subdirs.sort()
@@ -305,7 +307,15 @@ def associate_dirs(ldirs, rdirs, calc_similarity, threshold=0.66):
     return unique_matches
 
 
-def calculate_dir_pairings(ldir, rdir, threshold=0.66):
+def calculate_standard_deviation(data):
+    assert data
+    mean = float(sum(data)) / len(data)             # Data mean.
+    msds = [(v - mean)*(v - mean) for v in data]    # Mean-squared-deviation.
+    variance = sum(msds) / len(msds)                # Variance.
+    return math.sqrt(variance)                      # Standard deviation.
+
+
+def calculate_dir_pairings(ldir, rdir):
     ldirs, rdirs = [ldir], [rdir]
 
     extend_index = 0
@@ -391,40 +401,41 @@ def calculate_dir_pairings(ldir, rdir, threshold=0.66):
         structure_same = sum([p[2] for p in structure])
         structure_diff = sum([p[3] for p in structure])
         structure_ratio = float(structure_same) / (structure_same + structure_diff)
+        structure_sd = calculate_standard_deviation([p[0].level - p[1].level
+                                                     for p in structure])
 
         # Add the structure to all structures.
-        possible_structures.append((structure, structure_ratio))
+        possible_structures.append((structure, structure_ratio, structure_sd))
 
+    # Sort the structures by their ratio.
+    possible_structures.sort(key=lambda k: k[1], reverse=True)
 
     print('possible_structures:\n' + '\n\n'.join(
         ['\n'.join(
             ['  (%s, %s)' % (str(l), str(r)) for l, r, s, d, v in struct[0]]
-        ) + '\n= %.2f' % (struct[1]) for struct in possible_structures]
-        ))
+        ) + '\n%.3f, %.3f' % (struct[1], struct[2]) for struct in possible_structures]
+        ) + '\n')
     if not possible_structures:
         raise Exception('I have failed you')
 
-    # Extract the best pairings possible until none remain.
-    unique_pairings = []
-    # Ensure we only look at the side with the fewest directories.
-    side_index = 0 if len(ldirs) <= len(rdirs) else 1
-    for pair in possible_pairings:
-        if pair[2] < threshold:
+    # Remove all structures which are less than 5% as similar as the best match
+    # (which may be tied or very close to other matches).
+    to_remove = 1
+    while to_remove < len(possible_structures):
+        if possible_structures[to_remove][1] < possible_structures[0][1] - 0.05:
             break
-        if pair[side_index] not in [m[side_index] for m in unique_pairings]:
-            unique_pairings.append((pair[0], pair[1]))
+        to_remove += 1
+    possible_structures = possible_structures[:to_remove]
 
-    # Add the missing unpaired subdirs.
-    for ld in ldirs:
-        if ld not in [m[0] for m in unique_pairings]:
-            unique_pairings.append((ld, None))
-    for rd in rdirs:
-        if rd not in [m[1] for m in unique_pairings]:
-            unique_pairings.append((None, rd))
+    # Resort the structures by their alignment-level standard deviation.
+    possible_structures.sort(key=lambda k: k[2], reverse=False)
 
-    print('  calculate_dir_pairings = ' + str(['(%s, %s)' % (str(m[0]), str(m[1])) for m in unique_pairings]))
-    return unique_pairings
+    best_structure = possible_structures[0]
+    print('best_structure:\n'
+          + '\n'.join(['  (%s, %s)' % (str(l), str(r)) for l, r, s, d, v in best_structure[0]])
+          + '\n%.3f, %.3f' % (best_structure[1], best_structure[2]) + '\n')
 
+    return best_structure[0]
 
 def calculate_file_counts(lfiles, rfiles):
     lfile_hashes = [f.hash for f in lfiles]
